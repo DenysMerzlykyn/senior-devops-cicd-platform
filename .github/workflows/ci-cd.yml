@@ -1,0 +1,168 @@
+name: Production CI/CD Platform
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/denysmerzlykyn/senior-devops-cicd-platform/app
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+
+  ci:
+    name: CI — Test Application
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Run tests
+        working-directory: app
+        run: npm test
+
+  docker_build:
+    name: Build Docker Image
+    needs: ci
+    runs-on: ubuntu-latest
+    outputs:
+      image_sha_tag: ${{ steps.meta.outputs.image_sha_tag }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Define image metadata
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image_sha_tag=${IMAGE_NAME}:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image (PR — no push)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: ${{ steps.meta.outputs.image_sha_tag }}
+
+      - name: Build and push image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image_sha_tag }}
+            ${{ env.IMAGE_NAME }}:latest
+
+  security_scan:
+    name: Security Scan
+    needs: docker_build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ needs.docker_build.outputs.image_sha_tag }}
+          format: table
+          exit-code: 0
+          severity: CRITICAL,HIGH
+
+  deploy_production:
+    name: Blue/Green Deploy to Production
+    needs: [docker_build, security_scan]
+    runs-on: ubuntu-latest
+    # Requires repo variable DEPLOY_ENABLED=true and GitHub Secrets SERVER_HOST/SERVER_USER/SERVER_SSH_KEY
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.DEPLOY_ENABLED == 'true'
+    environment:
+      name: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Copy deployment files to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          source: "deploy/docker-compose.slot.yml,deploy/deploy.sh,deploy/rollback.sh,deploy/nginx-template.conf"
+          target: "/tmp/senior-devops-cicd"
+
+      - name: Deploy inactive blue/green slot
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            set -euo pipefail
+
+            sudo mkdir -p /opt/senior-devops-cicd
+            sudo cp /tmp/senior-devops-cicd/deploy/docker-compose.slot.yml /opt/senior-devops-cicd/
+            sudo cp /tmp/senior-devops-cicd/deploy/deploy.sh /opt/senior-devops-cicd/
+            sudo cp /tmp/senior-devops-cicd/deploy/rollback.sh /opt/senior-devops-cicd/
+            sudo cp /tmp/senior-devops-cicd/deploy/nginx-template.conf /opt/senior-devops-cicd/
+            sudo chmod +x /opt/senior-devops-cicd/deploy.sh /opt/senior-devops-cicd/rollback.sh
+
+            cd /opt/senior-devops-cicd
+            sudo IMAGE_NAME="${{ needs.docker_build.outputs.image_sha_tag }}" \
+              APP_VERSION="${{ needs.docker_build.outputs.short_sha }}" \
+              ./deploy.sh
+
+  smoke_test:
+    name: Public Smoke Test
+    needs: deploy_production
+    runs-on: ubuntu-latest
+    if: vars.DEPLOY_ENABLED == 'true'
+
+    steps:
+      - name: Check production health endpoint
+        run: |
+          curl -fsS "http://${{ secrets.SERVER_HOST }}/health"
+          echo
+          echo "Smoke test passed"

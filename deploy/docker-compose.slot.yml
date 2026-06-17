@@ -1,0 +1,18 @@
+services:
+  app:
+    image: ${IMAGE_NAME}
+    container_name: senior-cicd-${APP_SLOT}
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: production
+      APP_VERSION: ${APP_VERSION}
+      APP_SLOT: ${APP_SLOT}
+      PORT: 3000
+    ports:
+      - "127.0.0.1:${APP_PORT}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
